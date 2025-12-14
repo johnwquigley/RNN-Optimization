@@ -36,7 +36,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 def generate_data():
-    global total_values_in_one_chunck, train_size, test_size
+    global total_values_in_one_chunck, train_size, test_size, BPTT_T, series_length, echo_step, batch_size
 
     train_data = EchoData(
         echo_step=echo_step,
@@ -95,6 +95,7 @@ class SimpleRNN(nn.Module):
         return out, hidden, all_hidden, hidden_states_list
     
 
+# Probably don't even use train
 def train():
     model.train()
     
@@ -125,7 +126,8 @@ def train():
         
     return correct, loss.item()
 
-def test(model):
+def test(model, test_data):
+    global total_values_in_one_chunck, test_size
     model.eval()   
     correct = 0
     # New epoch --> fresh hidden state
@@ -141,7 +143,8 @@ def test(model):
 
     return correct
 
-def modified_train_regular():
+def modified_train_regular(model, optimizer, criterion, train_data):
+    global total_values_in_one_chunck, train_size
     model.train()
 
     # New epoch --> fresh hidden state
@@ -150,6 +153,7 @@ def modified_train_regular():
 
     total_loss = 0
     total_acc = 0
+    loss_arr = []
 
     for batch_idx in (range(iterations)):
         data, target = train_data[batch_idx]
@@ -163,6 +167,8 @@ def modified_train_regular():
         loss.backward()
         optimizer.step()
         
+        loss_arr.append(loss.detach().clone().cpu().item())
+
         pred = (torch.sigmoid(logits) > 0.5)
         correct = (pred == target.byte()).int().sum().item()/total_values_in_one_chunck # acc for this batch only
         with torch.no_grad():
@@ -170,42 +176,203 @@ def modified_train_regular():
             total_acc += correct
 
 
-    avg_acc = float(correct)*100/iterations
+    avg_acc = float(total_acc)*100/iterations
     avg_loss = total_loss/iterations
     # (f'Train Epoch: {epoch}/{n_epochs}, loss: {avg_loss:.3f}, accuracy {avg_acc:.1f}%')
-    return avg_acc, avg_loss
+    return avg_acc, avg_loss, loss_arr
+
+def compute_dE_dh(model, criterion, data, target, hidden=None): # returns an array
+    model.train()
+    seq_len = target.shape[1]
+
+    if hidden is not None: hidden.detach_()
+    logits, hidden, hidden_stack, hidden_list = model(data, hidden)
+    arr_dE_dh = []
+    sum_so_far = None
+    for i in range(seq_len):
+        dEi = []
+
+        loss = criterion(logits[:, i:i+1,:], target[:, i:i+1,:]) * torch.tensor(1/seq_len)
+        loss.backward(retain_graph=True)
+
+        if i == 0:
+            sum_so_far = [torch.zeros_like(hidden_list[0])] * len(hidden_list)
+        dEi = [x.grad.clone() for x in hidden_list]
+
+        for j in range(seq_len):
+            temp = dEi[j]
+            dEi[j] = dEi[j] - sum_so_far[j]
+            sum_so_far[j] = temp
+        arr_dE_dh.append(dEi)
+    
+    return arr_dE_dh, hidden_list
+
+# CHAT-GPTed code, might be wrong
+def compute_dE_dh_fast(model, criterion, data, target, hidden=None):
+    model.train()
+    seq_len = target.shape[1]
+
+    if hidden is not None:
+        hidden = hidden.detach()
+
+    logits, hidden, hidden_stack, hidden_list = model(data, hidden)
+
+    arr_dE_dh = []
+
+    for i in range(seq_len):
+        loss_i = criterion(
+            logits[:, i:i+1, :],
+            target[:, i:i+1, :]
+        ) / seq_len
+
+        grads = torch.autograd.grad(
+            loss_i,
+            hidden_list,
+            retain_graph=True,
+            allow_unused=True
+        )
+
+        arr_dE_dh.append([
+            g.clone() if g is not None else torch.zeros_like(h)
+            for g, h in zip(grads, hidden_list)
+        ])
+
+    return arr_dE_dh, hidden_list
+
+def populate_grad(model, dEi, start_idx, h_prev, model_dict, data, target, hidden=None): 
+    # Uses global data, target, seq_len, model
+
+    # Need to zero before calling if this is the only thing you want
+    # Need to pass in h_{-1} if you want to (probably not a huge deal, especially if the sequence is long)
+
+    # adjusts the model's parameters
+    model.train()
+
+    igates = torch.mm(data[:,start_idx,:].clone(), model_dict["rnn_cell.weight_ih"].t()) + model_dict["rnn_cell.bias_ih"] # These are the same p in our model
+    hgates = torch.mm(h_prev, model_dict["rnn_cell.weight_hh"].t()) + model_dict["rnn_cell.bias_hh"] # And when we call activation.backward, it
+    activation = torch.relu(igates + hgates)
+
+    # Wait, I can just compute a vector jacobian product, because dEt_dhk is a vector. And dhk+/dtheta is the Jacobian.
+    activation.backward(dEi[start_idx])
+
+def enhanced_train(model, train_data, ll_optimizer, optimizer, criterion):
+    global total_values_in_one_chunck, train_size
+    hidden = None
+    loss_arr = []
+
+    total_loss, total_acc = 0, 0
+
+    iterations = min(100, train_size)
+    # for batch in range(train_size):
+    # for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc="Batches")): 
+    for batch_idx in range(iterations):
+        data, target = train_data[batch_idx]
+        data, target = torch.from_numpy(data).float().to(device), torch.from_numpy(target).float().to(device)
+        seq_len = target.shape[1]    
+        
+        # for diff in range(seq_len):
+        assert BPTT_T == seq_len
+
+        ll_optimizer.zero_grad()
+        logits, hidden, hidden_stack, hidden_list = model(data, hidden)
+        loss = criterion(logits, target)
+
+        loss.backward()
+        ll_optimizer.step()
+        loss_arr.append(loss.detach().clone().cpu().item())
+
+        for diff in (range(seq_len)):
+
+            ### OPTIONAL
+            if diff > echo_step * 2:
+                continue
+            ###
+
+            print(batch_idx, diff)
+            optimizer[diff].zero_grad()
+            # arr_dE_dh, arr_h = compute_dE_dh(model, criterion, data, target, hidden)
+            arr_dE_dh, arr_h = compute_dE_dh_fast(model, criterion, data, target, hidden)
+
+            model_dict = {}
+            for name, p in model.named_parameters():
+                # print(name, p.shape)
+                # print(name, " grad ", p.grad)
+                # print(name, " param ", p)
+                model_dict[name] = p # These are the same p in our model. Need to do this after every optimizer step.
+                p.grad = None # Wait, so I'm resetting it every single time? And not letting them accumulate?
+
+            for i in range(seq_len - diff):
+                h_prev = -1 # h_{j-1}
+                if i == 0:
+                    h_prev = torch.zeros_like(arr_h[0]).to(device)
+                else:
+                    h_prev = arr_h[i-1].detach().clone()
+                hidden = hidden.detach() if hidden is not None else None
+                hidden = None
+                populate_grad(model, arr_dE_dh[i+diff], i, h_prev, model_dict, data, target, hidden) # look at dE_{i+diff}/dh_i * dh_i+/dtheta
+
+            optimizer[diff].step()
+
+        pred = (torch.sigmoid(logits) > 0.5)
+        correct = (pred == target.byte()).int().sum().item()/total_values_in_one_chunck # acc for this batch only
+        with torch.no_grad():
+            total_loss += loss.detach().cpu().item()
+            total_acc += correct
+
+    avg_acc = float(total_acc)*100/iterations
+    avg_loss = total_loss/iterations
+    # (f'Train Epoch: {epoch}/{n_epochs}, loss: {avg_loss:.3f}, accuracy {avg_acc:.1f}%')
+    return avg_acc, avg_loss, loss_arr
 
 def run_trial(seed, standard,
-              batch_size=5, 
-              echo_step=5, 
-              series_length=20_000, 
-              BPTT_T=100,
+              
+              # Need dummy to reassign global values
+              batch_size_d=5, 
+              echo_step_d=5, 
+              series_length_d=20_000, 
+              BPTT_T_d=100,
+
               h_units=20,
               optimizer_args={"lr":0.001, "betas":(0.95, 0.95)},
               n_epochs=10):
     set_seed(seed)
+    global BPTT_T, series_length, echo_step, batch_size, feature_dim
 
-    batch_size=batch_size
-    echo_step=echo_step
-    series_length=series_length
-    BPTT_T=BPTT_T
-    h_units=h_units
+
+    batch_size=batch_size_d
+    echo_step=echo_step_d
+    series_length=series_length_d
+    BPTT_T=BPTT_T_d
 
     train_data, test_data = generate_data()
     model = SimpleRNN(input_size=1, rnn_hidden_size=h_units, output_size=feature_dim)
     criterion = torch.nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), 
-                                    lr=optimizer_args["lr"], 
-                                    betas=optimizer_args["betas"])
 
-    epoch_dict = {"train_acc": [], "train_loss": [], "test_acc": []}
+    optimizer = None
+    ll_optimizer = None
+
+    if standard:
+        optimizer = torch.optim.AdamW(model.parameters(), 
+                                        lr=optimizer_args["lr"], 
+                                        betas=optimizer_args["betas"])
+    else:
+        optimizer = [torch.optim.AdamW(model.rnn_cell.parameters(), lr=0.001, betas=(0.95, 0.95)) for i in range(BPTT_T)]
+        ll_optimizer = torch.optim.AdamW(model.linear.parameters(), lr=0.001, betas=(0.95, 0.95))
+
+    epoch_dict = {"train_acc": [], "train_loss": [], "test_acc": [], "train_loss_arr": []}
 
     for epoch in range(n_epochs):
-        acc, loss = 0, 0
+        acc, loss, loss_arr = 0, 0, []
         if standard:
-            acc, loss = modified_train_regular()
+            acc, loss, loss_arr = modified_train_regular(model, optimizer, criterion, train_data)
         else:
-            acc, loss = modified_train_different()
+            acc, loss, loss_arr = enhanced_train(model, train_data, ll_optimizer, optimizer, criterion)
         epoch_dict["train_acc"].append(acc)
         epoch_dict["train_loss"].append(loss)
-        epoch_dict["test_acc"].append(float(test(model))*100/test_size)
+        epoch_dict["test_acc"].append(float(test(model, test_data))*100/test_size)
+        epoch_dict["train_loss_arr"].append(loss_arr)
+    
+    for key, value in epoch_dict.items():
+        print(key)
+        print(value)
+        print()
