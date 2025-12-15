@@ -262,7 +262,7 @@ def enhanced_train(model, train_data, ll_optimizer, optimizer, criterion):
 
     total_loss, total_acc = 0, 0
 
-    iterations = min(100, train_size)
+    iterations = min(1000, train_size)
     # for batch in range(train_size):
     # for batch_idx, (data, target) in enumerate(tqdm(train_loader, desc="Batches")): 
     for batch_idx in range(iterations):
@@ -281,6 +281,8 @@ def enhanced_train(model, train_data, ll_optimizer, optimizer, criterion):
         ll_optimizer.step()
         loss_arr.append(loss.detach().clone().cpu().item())
 
+        print(batch_idx, "/", iterations)
+
         for diff in (range(seq_len)):
 
             ### OPTIONAL
@@ -288,7 +290,6 @@ def enhanced_train(model, train_data, ll_optimizer, optimizer, criterion):
                 continue
             ###
 
-            print(batch_idx, diff)
             optimizer[diff].zero_grad()
             # arr_dE_dh, arr_h = compute_dE_dh(model, criterion, data, target, hidden)
             arr_dE_dh, arr_h = compute_dE_dh_fast(model, criterion, data, target, hidden)
@@ -334,6 +335,7 @@ def run_trial(seed, standard,
 
               h_units=20,
               optimizer_args={"lr":0.001, "betas":(0.95, 0.95)},
+              ll_optimizer_args={"lr": 0.001, "betas": (0.95, 0.95)},
               n_epochs=10):
     set_seed(seed)
     global BPTT_T, series_length, echo_step, batch_size, feature_dim
@@ -356,13 +358,22 @@ def run_trial(seed, standard,
                                         lr=optimizer_args["lr"], 
                                         betas=optimizer_args["betas"])
     else:
-        optimizer = [torch.optim.AdamW(model.rnn_cell.parameters(), lr=0.001, betas=(0.95, 0.95)) for i in range(BPTT_T)]
-        ll_optimizer = torch.optim.AdamW(model.linear.parameters(), lr=0.001, betas=(0.95, 0.95))
+        optimizer = [torch.optim.AdamW(model.rnn_cell.parameters(), lr=optimizer_args['lr'], betas=optimizer_args['betas']) for i in range(BPTT_T)]
+        ll_optimizer = torch.optim.AdamW(model.linear.parameters(), lr=ll_optimizer_args['lr'], betas=ll_optimizer_args['betas'])
 
-    epoch_dict = {"train_acc": [], "train_loss": [], "test_acc": [], "train_loss_arr": []}
+    epoch_dict = {"standard": standard, 
+                  "train_acc": [], 
+                  "train_loss": [], 
+                  "test_acc": [], 
+                  "train_loss_arr": [],
+                  "ll_optimizer": None,
+                  "optimizer": None
+                  }
+
 
     for epoch in range(n_epochs):
         acc, loss, loss_arr = 0, 0, []
+        print(epoch, epoch, epoch)
         if standard:
             acc, loss, loss_arr = modified_train_regular(model, optimizer, criterion, train_data)
         else:
@@ -372,7 +383,11 @@ def run_trial(seed, standard,
         epoch_dict["test_acc"].append(float(test(model, test_data))*100/test_size)
         epoch_dict["train_loss_arr"].append(loss_arr)
     
-    for key, value in epoch_dict.items():
-        print(key)
-        print(value)
-        print()
+
+    epoch_dict["ll_optimizer"] = ll_optimizer
+    epoch_dict["optimizer"] = optimizer
+    # for key, value in epoch_dict.items():
+    #     print(key)
+    #     print(value)
+    #     print()
+    return epoch_dict
