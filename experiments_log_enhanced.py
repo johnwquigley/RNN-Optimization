@@ -143,7 +143,7 @@ def test(model, test_data):
 
     return correct
 
-def modified_train_regular(model, optimizer, criterion, train_data):
+def modified_train_regular(model, optimizer, criterion, train_data, test_data):
     global total_values_in_one_chunck, train_size
     model.train()
 
@@ -155,6 +155,9 @@ def modified_train_regular(model, optimizer, criterion, train_data):
     total_acc = 0
     loss_arr = []
 
+    grad_arr = []
+    test_acc = []
+
     for batch_idx in (range(iterations)):
         data, target = train_data[batch_idx]
         data, target = torch.from_numpy(data).float().to(device), torch.from_numpy(target).float().to(device)
@@ -165,12 +168,26 @@ def modified_train_regular(model, optimizer, criterion, train_data):
 
         loss = criterion(logits, target) # loss for this batch only
         loss.backward()
+
+        model_dict = {}
+        for name, p in model.named_parameters():
+            model_dict[name] = {
+                'param': p.detach().clone(),
+                'grad': p.grad.detach().clone() if p.grad is not None else None
+            }
+
+        grad_arr.append(model_dict)
+
         optimizer.step()
         
         loss_arr.append(loss.detach().clone().cpu().item())
 
         pred = (torch.sigmoid(logits) > 0.5)
         correct = (pred == target.byte()).int().sum().item()/total_values_in_one_chunck # acc for this batch only
+        
+        if batch_idx % 100 == 0:
+            test_acc.append(test(model, test_data))      
+
         with torch.no_grad():
             total_loss += loss.detach().cpu().item()
             total_acc += correct
@@ -179,7 +196,7 @@ def modified_train_regular(model, optimizer, criterion, train_data):
     avg_acc = float(total_acc)*100/iterations
     avg_loss = total_loss/iterations
     # (f'Train Epoch: {epoch}/{n_epochs}, loss: {avg_loss:.3f}, accuracy {avg_acc:.1f}%')
-    return avg_acc, avg_loss, loss_arr
+    return avg_acc, avg_loss, {"loss": loss_arr, "grad": grad_arr, "test_acc": test_acc}
 
 def compute_dE_dh(model, criterion, data, target, hidden=None): # returns an array
     model.train()
@@ -255,12 +272,13 @@ def populate_grad(model, dEi, start_idx, h_prev, model_dict, data, target, hidde
     # Wait, I can just compute a vector jacobian product, because dEt_dhk is a vector. And dhk+/dtheta is the Jacobian.
     activation.backward(dEi[start_idx])
 
-def enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion):
+def enhanced_train_log(model, train_data, test_data, ll_optimizer, optimizer, criterion):
     global total_values_in_one_chunck, train_size
     hidden = None
     loss_arr = []
     grad_arr = []
     optim_arr = []
+    test_acc = []
 
     total_loss, total_acc = 0, 0
 
@@ -286,6 +304,7 @@ def enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion):
         grad_arr_diff = []
         optim_arr_diff = [] # per batch computations over each diff
         print(batch_idx, "/", iterations)
+
 
         for diff in (range(seq_len)):
 
@@ -321,18 +340,24 @@ def enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion):
             # It looks like the gradient norms grow together, suggesting some oscillatory behavior
             # It probably doesn't hurt to do both
             max_norm = 1.0  # or any threshold you choose
-            torch.nn.utils.clip_grad_norm_(model.rnn_cell["weight_hh"].parameters(), max_norm)
+            torch.nn.utils.clip_grad_norm_(model.rnn_cell.parameters(), max_norm)
 
             for name, p in model.named_parameters():
-                model_dict[name] = p.detach().clone() # Parameter values before the step
+                model_dict[name] = {
+                    'param': p.detach().clone(),
+                    'grad': p.grad.detach().clone() if p.grad is not None else None
+                }
+
             grad_arr_diff.append(model_dict)
             # so grad_arr_diff now holds the grads
 
             # don't step yet
         for diff in range(seq_len):
-            optimizer.zero_grad()
+            if diff > echo_step * 2:
+                continue
+            optimizer[diff].zero_grad()
             for name, p in model.named_parameters():
-                p.grad = grad_arr_diff[diff][name].grad
+                p.grad = grad_arr_diff[diff][name]['grad']
 
             optimizer[diff].step()
 
@@ -356,13 +381,14 @@ def enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion):
         with torch.no_grad():
             total_loss += loss.detach().cpu().item()
             total_acc += correct
+            
+        if batch_idx % 100 == 0:
+            test_acc.append(test(model, test_data))  
 
     avg_acc = float(total_acc)*100/iterations
     avg_loss = total_loss/iterations
     # (f'Train Epoch: {epoch}/{n_epochs}, loss: {avg_loss:.3f}, accuracy {avg_acc:.1f}%')
-    return avg_acc, avg_loss, {"loss": loss_arr, "grad": grad_arr, "optim": optim_arr}
-
-
+    return avg_acc, avg_loss, {"loss": loss_arr, "grad": grad_arr, "optim": optim_arr, "test_acc": test_acc}
 
 def run_trial(seed, standard,
               
@@ -414,10 +440,10 @@ def run_trial(seed, standard,
         acc, loss, loss_arr = 0, 0, []
         print(epoch, epoch, epoch)
         if standard:
-            acc, loss, loss_arr = modified_train_regular(model, optimizer, criterion, train_data)
+            acc, loss, loss_arr = modified_train_regular(model, optimizer, criterion, train_data, test_data)
         else:
             # acc, loss, loss_arr = enhanced_train(model, train_data, ll_optimizer, optimizer, criterion)
-            acc, loss, loss_arr = enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion)
+            acc, loss, loss_arr = enhanced_train_log(model, train_data, test_data, ll_optimizer, optimizer, criterion)
         epoch_dict["train_acc"].append(acc)
         epoch_dict["train_loss"].append(loss)
         epoch_dict["test_acc"].append(float(test(model, test_data))*100/test_size)

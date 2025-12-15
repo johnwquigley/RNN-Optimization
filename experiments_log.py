@@ -317,8 +317,14 @@ def enhanced_train_log(model, train_data, ll_optimizer, optimizer, criterion):
                 populate_grad(model, arr_dE_dh[i+diff], i, h_prev, model_dict, data, target, hidden) # look at dE_{i+diff}/dh_i * dh_i+/dtheta
 
 
+            # for name, p in model.named_parameters():
+            #     model_dict[name] = p.detach().clone() # Parameter values before the step
+            # grad_arr_diff.append(model_dict)
             for name, p in model.named_parameters():
-                model_dict[name] = p.detach().clone() # Parameter values before the step
+                model_dict[name] = {
+                    'param': p.detach().clone(),
+                    'grad': p.grad.detach().clone() if p.grad is not None else None
+                }
             grad_arr_diff.append(model_dict)
 
             optimizer[diff].step()
