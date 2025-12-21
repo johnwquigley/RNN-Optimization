@@ -292,14 +292,6 @@ def enhanced_train_log(model, train_data, test_data, ll_optimizer, optimizer, cr
         
         # for diff in range(seq_len):
         assert BPTT_T == seq_len
-
-        ll_optimizer.zero_grad()
-        logits, hidden, hidden_stack, hidden_list = model(data, hidden)
-        loss = criterion(logits, target)
-
-        loss.backward()
-        ll_optimizer.step()
-        loss_arr.append(loss.detach().clone().cpu().item())
         
         grad_arr_diff = []
         optim_arr_diff = [] # per batch computations over each diff
@@ -374,6 +366,14 @@ def enhanced_train_log(model, train_data, test_data, ll_optimizer, optimizer, cr
                     }
             optim_arr_diff.append(step_info)
 
+        ll_optimizer.zero_grad()
+        logits, hidden, hidden_stack, hidden_list = model(data, hidden)
+        loss = criterion(logits, target)
+
+        loss.backward()
+        ll_optimizer.step()
+        loss_arr.append(loss.detach().clone().cpu().item())
+
         optim_arr.append(optim_arr_diff)
         grad_arr.append(grad_arr_diff)
         pred = (torch.sigmoid(logits) > 0.5)
@@ -381,7 +381,7 @@ def enhanced_train_log(model, train_data, test_data, ll_optimizer, optimizer, cr
         with torch.no_grad():
             total_loss += loss.detach().cpu().item()
             total_acc += correct
-            
+
         if batch_idx % 100 == 0:
             test_acc.append(test(model, test_data))  
 
